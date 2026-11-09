@@ -27,14 +27,38 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      - name: Locate Android project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          SETTINGS_FILE="$(find . -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/.gradle/*' -not -path '*/build/*' | head -n 1)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "ERROR: settings.gradle or settings.gradle.kts was not found."
+            echo "Upload the CONTENTS of the BatchRename project ZIP to the repository."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "ERROR: Android app module was not found at $PROJECT_DIR/app."
+            echo "Check that the app folder and its build.gradle.kts file were uploaded."
+            exit 1
+          fi
+
+          echo "Android project found at: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Build debug APK
-        run: gradle assembleDebug
+        run: gradle -p "${{ steps.project.outputs.project_dir }}" :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: BatchRename-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
-          

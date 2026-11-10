@@ -1,7 +1,9 @@
+
 package com.sambhav.batchrename
 
 import android.app.Activity
 import android.content.Intent
+import android.content.ClipData
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
@@ -18,16 +20,17 @@ import java.util.LinkedHashMap
 
 class MainActivity : Activity() {
 
-    private data class FileItem(
+    data class FileItem(
         val uri: Uri,
         val name: String,
         val mime: String
     )
 
     private val folderRequest = 101
-    private val ftpPackage = "com.wftpserver.ftprush"
 
     private var folderUri: Uri? = null
+    private var folderDocumentUri: Uri? = null
+
     private val files = mutableListOf<FileItem>()
     private val selected = LinkedHashMap<Uri, FileItem>()
     private val uploadedReady = mutableListOf<Uri>()
@@ -54,7 +57,7 @@ class MainActivity : Activity() {
         refresh()
     }
 
-    private fun dp(v: Int) =
+    private fun dp(v: Int): Int =
         (v * resources.displayMetrics.density).toInt()
 
     private fun rounded(color: Int, radius: Int) =
@@ -63,15 +66,19 @@ class MainActivity : Activity() {
             cornerRadius = dp(radius).toFloat()
         }
 
-    private fun label(value: String, size: Float, color: Int, bold: Boolean = false) =
-        TextView(this).apply {
-            text = value
-            textSize = size
-            setTextColor(color)
-            if (bold) typeface = Typeface.DEFAULT_BOLD
-        }
+    private fun label(
+        value: String,
+        size: Float,
+        color: Int,
+        bold: Boolean = false
+    ) = TextView(this).apply {
+        text = value
+        textSize = size
+        setTextColor(color)
+        if (bold) typeface = Typeface.DEFAULT_BOLD
+    }
 
-    private fun button(value: String, primary: Boolean) =
+    private fun makeButton(value: String, primary: Boolean) =
         Button(this).apply {
             text = value
             isAllCaps = false
@@ -95,7 +102,7 @@ class MainActivity : Activity() {
         root.addView(t)
     }
 
-    private fun card(): LinearLayout =
+    private fun makeCard() =
         LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = rounded(Color.WHITE, 15)
@@ -128,43 +135,46 @@ class MainActivity : Activity() {
         root.addView(heading)
 
         root.addView(
-            label("Choose a folder, enter a filename and rename multiple files.", 14f, muted)
+            label(
+                "Choose a folder, enter a filename and rename multiple files.",
+                14f, muted
+            )
         )
 
         gap(25)
-        section("01  /  DESTINATION FOLDER")
+        section("01 / DESTINATION FOLDER")
 
-        val folderCard = card()
+        val folderCard = makeCard()
         folderLabel = label("No folder selected", 13f, muted)
         folderCard.addView(folderLabel)
         root.addView(folderCard)
 
-        val folderButton = button("Choose folder", false)
+        val folderButton = makeButton("Choose folder", false)
         folderButton.setOnClickListener { chooseFolder() }
         root.addView(folderButton, buttonParams())
 
         gap(23)
-        section("02  /  CUSTOM FILENAME")
+        section("02 / CUSTOM FILENAME")
 
         filenameInput = EditText(this).apply {
             hint = "e.g. 09 Nov Patna Food Safety Department Raid"
             textSize = 14f
             setTextColor(ink)
             setHintTextColor(muted)
-            singleLine = true
+            setSingleLine(true)
             setPadding(dp(15), dp(13), dp(15), dp(13))
             background = rounded(Color.WHITE, 13)
         }
+
         root.addView(filenameInput, buttonParams())
 
         gap(23)
-        section("03  /  SELECT FILES")
+        section("03 / SELECT FILES")
 
-        fileList = card()
-        fileList.addView(label("Choose a folder first.", 13f, muted))
+        fileList = makeCard()
         root.addView(fileList)
 
-        val clearButton = button("Clear selection", false)
+        val clearButton = makeButton("Clear selection", false)
         clearButton.setOnClickListener {
             selected.clear()
             refresh()
@@ -172,9 +182,9 @@ class MainActivity : Activity() {
         root.addView(clearButton, buttonParams())
 
         gap(23)
-        section("04  /  PREVIEW")
+        section("04 / PREVIEW")
 
-        val previewCard = card()
+        val previewCard = makeCard()
         preview = label("Your new filenames will appear here.", 13f, muted)
         previewCard.addView(preview)
         root.addView(previewCard)
@@ -185,18 +195,19 @@ class MainActivity : Activity() {
         status.gravity = Gravity.CENTER
         root.addView(status, buttonParams())
 
-        renameButton = button("Rename selected files", true)
+        renameButton = makeButton("Rename selected files", true)
         renameButton.setOnClickListener { renameFiles() }
         root.addView(renameButton, buttonParams())
 
-        uploadButton = button("Upload to FTP Rush", false)
+        uploadButton = makeButton("Upload to FTP Rush", false)
         uploadButton.setOnClickListener { uploadFiles() }
         root.addView(uploadButton, buttonParams())
 
         gap(15)
+
         root.addView(
             label(
-                "Renaming creates new copies and deletes originals only after successful verification. If deletion is refused, the original is kept.",
+                "Files are copied with their new names. Originals are deleted only after successful verification.",
                 12f, muted
             )
         )
@@ -226,7 +237,12 @@ class MainActivity : Activity() {
                 Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
             )
         }
-        startActivityForResult(intent, folderRequest)
+
+        try {
+            startActivityForResult(intent, folderRequest)
+        } catch (e: Exception) {
+            toast("Could not open folder picker.")
+        }
     }
 
     @Deprecated("Document picker compatibility")
@@ -238,7 +254,8 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
 
         if (requestCode != folderRequest ||
-            resultCode != RESULT_OK || data?.data == null
+            resultCode != RESULT_OK ||
+            data?.data == null
         ) return
 
         val uri = data.data!!
@@ -248,16 +265,26 @@ class MainActivity : Activity() {
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
+
             contentResolver.takePersistableUriPermission(uri, flags)
+
+            val documentId = DocumentsContract.getTreeDocumentId(uri)
+
+            folderDocumentUri =
+                DocumentsContract.buildDocumentUriUsingTree(
+                    uri, documentId
+                )
+
+            folderUri = uri
+
+            selected.clear()
+            uploadedReady.clear()
+
+            loadFolder()
+
         } catch (e: Exception) {
             status.text = "Folder permission error: ${e.message}"
-            return
         }
-
-        folderUri = uri
-        selected.clear()
-        uploadedReady.clear()
-        loadFolder()
     }
 
     private fun loadFolder() {
@@ -267,12 +294,13 @@ class MainActivity : Activity() {
 
         try {
             val documentId = DocumentsContract.getTreeDocumentId(tree)
+
             val childrenUri =
                 DocumentsContract.buildChildDocumentsUriUsingTree(
                     tree, documentId
                 )
 
-            val cursor = contentResolver.query(
+            contentResolver.query(
                 childrenUri,
                 arrayOf(
                     DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -280,78 +308,102 @@ class MainActivity : Activity() {
                     DocumentsContract.Document.COLUMN_MIME_TYPE
                 ),
                 null, null, null
-            )
+            )?.use { cursor ->
 
-            cursor?.use {
-                while (it.moveToNext()) {
-                    val id = it.getString(0)
-                    val name = it.getString(1)
-                    val mime = it.getString(2)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getString(0)
+                    val name = cursor.getString(1)
+                    val mime = cursor.getString(2)
 
                     if (mime != DocumentsContract.Document.MIME_TYPE_DIR) {
-                        val uri =
+                        val fileUri =
                             DocumentsContract.buildDocumentUriUsingTree(
                                 tree, id
                             )
-                        files.add(FileItem(uri, name, mime))
+
+                        files.add(FileItem(fileUri, name, mime))
                     }
                 }
             }
 
             folderLabel.text = "Folder selected · ${files.size} files"
-            status.text = "Select files in the order you want numbered."
-            renderFiles()
+            status.text = "Select files in your desired order."
+
+            refresh()
 
         } catch (e: Exception) {
             status.text = "Could not read folder: ${e.message}"
         }
     }
 
+    private fun refresh() {
+        if (!::fileList.isInitialized) return
+
+        folderLabel.text = if (folderUri == null) {
+            "No folder selected"
+        } else {
+            "Folder selected · ${files.size} files"
+        }
+
+        renderFiles()
+        updatePreview()
+
+        renameButton.isEnabled =
+            folderUri != null &&
+            selected.isNotEmpty() &&
+            cleanBase().isNotBlank()
+
+        renameButton.alpha =
+            if (renameButton.isEnabled) 1f else 0.45f
+
+        uploadButton.isEnabled = uploadedReady.isNotEmpty()
+        uploadButton.alpha =
+            if (uploadButton.isEnabled) 1f else 0.45f
+    }
+
     private fun renderFiles() {
         fileList.removeAllViews()
 
         if (files.isEmpty()) {
-            fileList.addView(label("No files found in this folder.", 13f, muted))
+            fileList.addView(
+                label("Choose a folder to display its files.", 13f, muted)
+            )
             return
         }
 
         files.forEach { file ->
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(5), 0, dp(5))
-            }
 
             val checkbox = CheckBox(this).apply {
                 text = file.name
                 textSize = 12f
                 setTextColor(ink)
+
                 isChecked = selected.containsKey(file.uri)
+
                 setOnCheckedChangeListener { _, checked ->
                     if (checked) {
                         selected[file.uri] = file
                     } else {
                         selected.remove(file.uri)
                     }
+
                     updatePreview()
+                    updateButtons()
                 }
             }
 
-            row.addView(
+            fileList.addView(
                 checkbox,
                 LinearLayout.LayoutParams(-1, -2)
             )
-
-            fileList.addView(row)
         }
-
-        updatePreview()
     }
 
     private fun extension(name: String): String {
         val dot = name.lastIndexOf('.')
-        return if (dot > 0 && dot < name.length - 1)
-            name.substring(dot) else ""
+        return if (dot > 0 && dot < name.length - 1) {
+            name.substring(dot)
+        } else ""
     }
 
     private fun cleanBase(): String {
@@ -368,132 +420,28 @@ class MainActivity : Activity() {
     private fun updatePreview() {
         if (!::preview.isInitialized) return
 
-        val base = cleanBase()
-
-        if (base.isBlank() || selected.isEmpty()) {
+        if (cleanBase().isBlank() || selected.isEmpty()) {
             preview.text = "Enter a filename and select files."
             return
         }
 
-        val result = selected.values.mapIndexed { index, file ->
+        preview.text = selected.values.mapIndexed { index, file ->
             targetName(index + 1, file)
-        }
-
-        preview.text = result.joinToString("\n\n")
+        }.joinToString("\n\n")
     }
 
-    private fun renameFiles() {
-        val tree = folderUri ?: return
-        val base = cleanBase()
-        val chosen = selected.values.toList()
+    private fun updateButtons() {
+        renameButton.isEnabled =
+            folderUri != null &&
+            selected.isNotEmpty() &&
+            cleanBase().isNotBlank()
 
-        if (base.isBlank()) {
-            toast("Enter a filename first.")
-            return
-        }
+        renameButton.alpha =
+            if (renameButton.isEnabled) 1f else 0.45f
 
-        if (chosen.isEmpty()) {
-            toast("Select at least one file.")
-            return
-        }
-
-        uploadedReady.clear()
-
-        val existingNames = files.map { it.name }.toMutableSet()
-        var copied = 0
-        var deleted = 0
-        val errors = mutableListOf<String>()
-
-        chosen.forEachIndexed { index, file ->
-            val name = targetName(index + 1, file)
-
-            if (name in existingNames && name != file.name) {
-                errors.add("$name already exists")
-                return@forEachIndexed
-            }
-
-            try {
-                val outputUri = DocumentsContract.createDocument(
-                    contentResolver,
-                    tree,
-                    file.mime.ifBlank { "application/octet-stream" },
-                    name
-                ) ?: throw IOException("Could not create destination file")
-
-                try {
-                    val input = contentResolver.openInputStream(file.uri)
-                        ?: throw IOException("Cannot read original file")
-
-                    val output = contentResolver.openOutputStream(outputUri)
-                        ?: throw IOException("Cannot write destination file")
-
-                    var bytes = 0L
-
-                    input.use { source ->
-                        output.use { destination ->
-                            val buffer = ByteArray(64 * 1024)
-                            while (true) {
-                                val count = source.read(buffer)
-                                if (count < 0) break
-                                destination.write(buffer, 0, count)
-                                bytes += count
-                            }
-                            destination.flush()
-                        }
-                    }
-
-                    val copiedSize = querySize(outputUri)
-
-                    if (copiedSize >= 0 && copiedSize != bytes) {
-                        throw IOException("Copy verification failed")
-                    }
-
-                    copied++
-                    existingNames.add(name)
-                    uploadedReady.add(outputUri)
-
-                    try {
-                        if (DocumentsContract.deleteDocument(
-                                contentResolver, file.uri
-                            )
-                        ) {
-                            deleted++
-                        } else {
-                            errors.add("$name copied, but original could not be deleted")
-                        }
-                    } catch (e: Exception) {
-                        errors.add("$name copied, but original could not be deleted: ${e.message}")
-                    }
-
-                } catch (e: Exception) {
-                    try {
-                        DocumentsContract.deleteDocument(contentResolver, outputUri)
-                    } catch (_: Exception) {}
-                    throw e
-                }
-
-            } catch (e: Exception) {
-                errors.add("${file.name}: ${e.message ?: "Unknown error"}")
-            }
-        }
-
-        status.text = "Created: $copied · Originals deleted: $deleted · Issues: ${errors.size}"
-        status.setTextColor(if (errors.isEmpty()) green else red)
-
-        if (errors.isNotEmpty()) {
-            android.app.AlertDialog.Builder(this)
-                .setTitle("Rename results")
-                .setMessage(
-                    "Created: $copied\nOriginals deleted: $deleted\n\n" +
-                    errors.joinToString("\n\n")
-                )
-                .setPositiveButton("OK", null)
-                .show()
-        } else {
-            toast("Successfully renamed $copied files.")
-        }
-
-        loadFolder()
+        uploadButton.isEnabled = uploadedReady.isNotEmpty()
+        uploadButton.alpha =
+            if (uploadButton.isEnabled) 1f else 0.45f
     }
 
     private fun querySize(uri: Uri): Long {
@@ -503,12 +451,160 @@ class MainActivity : Activity() {
                 arrayOf(OpenableColumns.SIZE),
                 null, null, null
             )?.use {
-                if (it.moveToFirst() && !it.isNull(0)) it.getLong(0)
-                else -1L
+                if (it.moveToFirst() && !it.isNull(0)) {
+                    it.getLong(0)
+                } else -1L
             } ?: -1L
         } catch (_: Exception) {
             -1L
         }
+    }
+
+    private fun renameFiles() {
+        val parent = folderDocumentUri ?: return
+        val base = cleanBase()
+        val chosen = selected.values.toList()
+
+        if (base.isBlank()) {
+            toast("Enter a filename first.")
+            return
+        }
+
+        if (chosen.isEmpty()) {
+            toast("Select files first.")
+            return
+        }
+
+        uploadedReady.clear()
+
+        val existingNames = files.map { it.name }.toMutableSet()
+
+        var copied = 0
+        var deleted = 0
+
+        val errors = mutableListOf<String>()
+
+        chosen.forEachIndexed { index, file ->
+
+            val newName = targetName(index + 1, file)
+
+            if (newName == file.name) {
+                uploadedReady.add(file.uri)
+                copied++
+                deleted++
+                return@forEachIndexed
+            }
+
+            if (newName in existingNames) {
+                errors.add("$newName already exists.")
+                return@forEachIndexed
+            }
+
+            var outputUri: Uri? = null
+
+            try {
+                outputUri = DocumentsContract.createDocument(
+                    contentResolver,
+                    parent,
+                    file.mime.ifBlank { "application/octet-stream" },
+                    newName
+                ) ?: throw IOException("Could not create destination file.")
+
+                val input = contentResolver.openInputStream(file.uri)
+                    ?: throw IOException("Cannot read original file.")
+
+                val output = contentResolver.openOutputStream(outputUri)
+                    ?: throw IOException("Cannot write new file.")
+
+                var bytes = 0L
+
+                input.use { source ->
+                    output.use { destination ->
+
+                        val buffer = ByteArray(64 * 1024)
+
+                        while (true) {
+                            val count = source.read(buffer)
+
+                            if (count < 0) break
+
+                            destination.write(buffer, 0, count)
+                            bytes += count
+                        }
+
+                        destination.flush()
+                    }
+                }
+
+                val newSize = querySize(outputUri)
+
+                if (newSize >= 0 && newSize != bytes) {
+                    throw IOException("File verification failed.")
+                }
+
+                copied++
+                existingNames.add(newName)
+                uploadedReady.add(outputUri)
+
+                try {
+                    if (DocumentsContract.deleteDocument(
+                            contentResolver, file.uri
+                        )
+                    ) {
+                        deleted++
+                    } else {
+                        errors.add(
+                            "$newName created, but original could not be deleted."
+                        )
+                    }
+                } catch (e: Exception) {
+                    errors.add(
+                        "$newName created, but original remains: ${e.message}"
+                    )
+                }
+
+            } catch (e: Exception) {
+
+                if (outputUri != null) {
+                    try {
+                        DocumentsContract.deleteDocument(
+                            contentResolver, outputUri
+                        )
+                    } catch (_: Exception) {}
+                }
+
+                errors.add(
+                    "${file.name}: ${e.message ?: "Unknown error"}"
+                )
+            }
+        }
+
+        selected.clear()
+
+        status.text =
+            "Created: $copied · Deleted: $deleted · Issues: ${errors.size}"
+
+        status.setTextColor(
+            if (errors.isEmpty()) green else red
+        )
+
+        loadFolder()
+
+        if (errors.isNotEmpty()) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Rename results")
+                .setMessage(
+                    "Created: $copied\n" +
+                    "Originals deleted: $deleted\n\n" +
+                    errors.joinToString("\n\n")
+                )
+                .setPositiveButton("OK", null)
+                .show()
+        } else {
+            toast("Successfully renamed $copied files.")
+        }
+
+        refresh()
     }
 
     private fun uploadFiles() {
@@ -521,16 +617,20 @@ class MainActivity : Activity() {
 
         val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
             type = "*/*"
-            putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+
+            putParcelableArrayListExtra(
+                Intent.EXTRA_STREAM, uris
+            )
+
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
-            clipData = android.content.ClipData.newUri(
+            clipData = ClipData.newUri(
                 contentResolver,
                 "BatchRename files",
                 uris.first()
             ).apply {
                 for (i in 1 until uris.size) {
-                    addItem(android.content.ClipData.Item(uris[i]))
+                    addItem(ClipData.Item(uris[i]))
                 }
             }
         }
@@ -540,25 +640,28 @@ class MainActivity : Activity() {
                 setPackage("com.wftpserver.ftprush")
             }
 
-            if (ftpIntent.resolveActivity(packageManager) != null) {
-                startActivity(ftpIntent)
-            } else {
-                startActivity(
-                    Intent.createChooser(intent, "Upload renamed files")
-                )
-            }
+            startActivity(ftpIntent)
+
         } catch (e: Exception) {
+
             try {
                 startActivity(
-                    Intent.createChooser(intent, "Share files")
+                    Intent.createChooser(
+                        intent,
+                        "Upload renamed files"
+                    )
                 )
             } catch (_: Exception) {
-                toast("Could not open FTP Rush.")
+                toast("Could not share files with FTP Rush.")
             }
         }
     }
 
     private fun toast(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        Toast.makeText(
+            this,
+            message,
+            Toast.LENGTH_LONG
+        ).show()
     }
 }

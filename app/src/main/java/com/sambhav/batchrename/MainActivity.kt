@@ -1,4 +1,3 @@
-
 package com.sambhav.batchrename
 
 import android.app.Activity

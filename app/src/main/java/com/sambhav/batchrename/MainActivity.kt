@@ -13,60 +13,57 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
-import java.util.LinkedHashSet
+import java.io.IOException
+import java.util.LinkedHashMap
 
 class MainActivity : Activity() {
 
-    data class PickedFile(
-        var uri: Uri,
-        val originalName: String,
-        var displayName: String
+    private data class FileItem(
+        val uri: Uri,
+        val name: String,
+        val mime: String
     )
 
-    private val TEMPLATE = 1001
-    private val OTHERS = 1002
+    private val folderRequest = 101
+    private val ftpPackage = "com.wftpserver.ftprush"
 
-    private var template: PickedFile? = null
-    private val otherFiles = mutableListOf<PickedFile>()
-    private val successfulFiles = mutableListOf<PickedFile>()
-    private val failedFiles = mutableListOf<String>()
+    private var folderUri: Uri? = null
+    private val files = mutableListOf<FileItem>()
+    private val selected = LinkedHashMap<Uri, FileItem>()
+    private val uploadedReady = mutableListOf<Uri>()
 
     private lateinit var root: LinearLayout
-    private lateinit var templateText: TextView
-    private lateinit var selectedText: TextView
-    private lateinit var preview: LinearLayout
+    private lateinit var folderLabel: TextView
+    private lateinit var filenameInput: EditText
+    private lateinit var fileList: LinearLayout
+    private lateinit var preview: TextView
     private lateinit var status: TextView
     private lateinit var renameButton: Button
     private lateinit var uploadButton: Button
 
     private val bg = Color.rgb(247, 248, 250)
-    private val card = Color.WHITE
-    private val ink = Color.rgb(27, 31, 39)
-    private val muted = Color.rgb(116, 123, 136)
-    private val accent = Color.rgb(92, 83, 210)
-    private val green = Color.rgb(25, 155, 104)
-    private val red = Color.rgb(195, 66, 66)
+    private val ink = Color.rgb(30, 32, 40)
+    private val muted = Color.rgb(115, 120, 133)
+    private val accent = Color.rgb(91, 82, 205)
+    private val green = Color.rgb(28, 145, 99)
+    private val red = Color.rgb(190, 60, 60)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        refreshUi()
+        refresh()
     }
 
     private fun dp(v: Int) =
         (v * resources.displayMetrics.density).toInt()
 
-    private fun rounded(color: Int, radius: Int): GradientDrawable =
+    private fun rounded(color: Int, radius: Int) =
         GradientDrawable().apply {
             setColor(color)
             cornerRadius = dp(radius).toFloat()
         }
 
-    private fun addGap(v: Int) {
-        root.addView(View(this), LinearLayout.LayoutParams(1, dp(v)))
-    }
-
-    private fun text(value: String, size: Float, color: Int, bold: Boolean = false): TextView =
+    private fun label(value: String, size: Float, color: Int, bold: Boolean = false) =
         TextView(this).apply {
             text = value
             textSize = size
@@ -74,16 +71,40 @@ class MainActivity : Activity() {
             if (bold) typeface = Typeface.DEFAULT_BOLD
         }
 
-    private fun makeButton(label: String, primary: Boolean): Button =
+    private fun button(value: String, primary: Boolean) =
         Button(this).apply {
-            text = label
+            text = value
             isAllCaps = false
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(if (primary) Color.WHITE else ink)
-            background = rounded(if (primary) accent else card, 13)
-            minHeight = dp(52)
+            background = rounded(
+                if (primary) accent else Color.WHITE, 13
+            )
+            minHeight = dp(50)
             stateListAnimator = null
+        }
+
+    private fun gap(v: Int) {
+        root.addView(View(this), LinearLayout.LayoutParams(1, dp(v)))
+    }
+
+    private fun section(value: String) {
+        val t = label(value, 11f, muted, true)
+        t.setPadding(0, 0, 0, dp(9))
+        root.addView(t)
+    }
+
+    private fun card(): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(Color.WHITE, 15)
+            setPadding(dp(15), dp(14), dp(15), dp(14))
+        }
+
+    private fun buttonParams() =
+        LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(9)
         }
 
     private fun buildUi() {
@@ -94,122 +115,118 @@ class MainActivity : Activity() {
 
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(30), dp(22), dp(30))
+            setPadding(dp(21), dp(28), dp(21), dp(30))
         }
 
         scroll.addView(root)
         setContentView(scroll)
 
-        root.addView(text("BATCHRENAME", 12f, accent, true))
+        root.addView(label("BATCHRENAME", 12f, accent, true))
 
-        val heading = text("Your files.\nPerfectly named.", 31f, ink, true)
-        heading.setPadding(0, dp(12), 0, dp(8))
+        val heading = label("Rename files.\nYour way.", 31f, ink, true)
+        heading.setPadding(0, dp(12), 0, dp(7))
         root.addView(heading)
 
         root.addView(
-            text(
-                "Rename multiple files using one naming template.",
-                14f, muted
-            )
+            label("Choose a folder, enter a filename and rename multiple files.", 14f, muted)
         )
 
-        addGap(28)
-        section("01  /  NAMING TEMPLATE")
+        gap(25)
+        section("01  /  DESTINATION FOLDER")
 
-        val templateCard = makeCard()
-        templateText = text("No template selected", 14f, muted)
-        templateCard.addView(templateText)
-        root.addView(templateCard)
+        val folderCard = card()
+        folderLabel = label("No folder selected", 13f, muted)
+        folderCard.addView(folderLabel)
+        root.addView(folderCard)
 
-        val templateButton = makeButton("Choose first file", false)
-        templateButton.setOnClickListener {
-            openPicker(TEMPLATE, false)
+        val folderButton = button("Choose folder", false)
+        folderButton.setOnClickListener { chooseFolder() }
+        root.addView(folderButton, buttonParams())
+
+        gap(23)
+        section("02  /  CUSTOM FILENAME")
+
+        filenameInput = EditText(this).apply {
+            hint = "e.g. 09 Nov Patna Food Safety Department Raid"
+            textSize = 14f
+            setTextColor(ink)
+            setHintTextColor(muted)
+            singleLine = true
+            setPadding(dp(15), dp(13), dp(15), dp(13))
+            background = rounded(Color.WHITE, 13)
         }
-        root.addView(templateButton, matchWrap())
+        root.addView(filenameInput, buttonParams())
 
-        addGap(24)
-        section("02  /  FILE SELECTION")
+        gap(23)
+        section("03  /  SELECT FILES")
 
-        val selectedCard = makeCard()
-        selectedText = text("No additional files selected", 14f, muted)
-        selectedCard.addView(selectedText)
-        root.addView(selectedCard)
+        fileList = card()
+        fileList.addView(label("Choose a folder first.", 13f, muted))
+        root.addView(fileList)
 
-        val selectButton = makeButton("Select multiple files", false)
-        selectButton.setOnClickListener {
-            if (template == null) {
-                toast("Choose a template first.")
-            } else {
-                openPicker(OTHERS, true)
-            }
+        val clearButton = button("Clear selection", false)
+        clearButton.setOnClickListener {
+            selected.clear()
+            refresh()
         }
-        root.addView(selectButton, matchWrap())
+        root.addView(clearButton, buttonParams())
 
-        addGap(24)
-        section("03  /  NAME PREVIEW")
+        gap(23)
+        section("04  /  PREVIEW")
 
-        preview = makeCard()
-        root.addView(preview)
+        val previewCard = card()
+        preview = label("Your new filenames will appear here.", 13f, muted)
+        previewCard.addView(preview)
+        root.addView(previewCard)
 
-        addGap(16)
+        gap(15)
 
-        status = text("Choose your first file to begin.", 13f, muted)
+        status = label("Ready.", 13f, muted)
         status.gravity = Gravity.CENTER
-        root.addView(status, matchWrap())
+        root.addView(status, buttonParams())
 
-        renameButton = makeButton("Rename all files", true)
-        renameButton.setOnClickListener { renameAll() }
-        root.addView(renameButton, matchWrap())
+        renameButton = button("Rename selected files", true)
+        renameButton.setOnClickListener { renameFiles() }
+        root.addView(renameButton, buttonParams())
 
-        uploadButton = makeButton("Upload to FTP Rush", false)
-        uploadButton.setOnClickListener { uploadToFtpRush() }
-        root.addView(uploadButton, matchWrap())
+        uploadButton = button("Upload to FTP Rush", false)
+        uploadButton.setOnClickListener { uploadFiles() }
+        root.addView(uploadButton, buttonParams())
 
-        addGap(16)
+        gap(15)
         root.addView(
-            text(
-                "Your original template remains unchanged. File extensions are preserved. Numbering follows selection order.",
+            label(
+                "Renaming creates new copies and deletes originals only after successful verification. If deletion is refused, the original is kept.",
                 12f, muted
             )
         )
+
+        filenameInput.addTextChangedListener(
+            object : android.text.TextWatcher {
+                override fun beforeTextChanged(
+                    s: CharSequence?, start: Int, count: Int, after: Int
+                ) {}
+
+                override fun onTextChanged(
+                    s: CharSequence?, start: Int, before: Int, count: Int
+                ) {
+                    updatePreview()
+                }
+
+                override fun afterTextChanged(s: android.text.Editable?) {}
+            }
+        )
     }
 
-    private fun section(value: String) {
-        val label = text(value, 11f, muted, true)
-        label.setPadding(0, 0, 0, dp(10))
-        root.addView(label)
-    }
-
-    private fun makeCard(): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = rounded(card, 16)
-            setPadding(dp(16), dp(15), dp(16), dp(15))
-        }
-
-    private fun matchWrap() =
-        LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(9) }
-
-    private fun openPicker(code: Int, multiple: Boolean) {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple)
+    private fun chooseFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
             addFlags(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
                 Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
             )
         }
-
-        try {
-            startActivityForResult(intent, code)
-        } catch (e: Exception) {
-            toast("Unable to open file picker.")
-        }
+        startActivityForResult(intent, folderRequest)
     }
 
     @Deprecated("Document picker compatibility")
@@ -220,83 +237,115 @@ class MainActivity : Activity() {
     ) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        if (resultCode != RESULT_OK || data == null) return
+        if (requestCode != folderRequest ||
+            resultCode != RESULT_OK || data?.data == null
+        ) return
 
-        if (requestCode == TEMPLATE) {
-            val uri = data.data ?: return
-            keepPermission(uri, data)
-
-            val name = queryName(uri) ?: "Selected file"
-            template = PickedFile(uri, name, name)
-
-            otherFiles.clear()
-            successfulFiles.clear()
-            failedFiles.clear()
-
-            status.text = "Template selected. Choose your files."
-        }
-
-        if (requestCode == OTHERS) {
-            val uris = LinkedHashSet<Uri>()
-
-            data.clipData?.let { clip ->
-                for (i in 0 until clip.itemCount) {
-                    uris.add(clip.getItemAt(i).uri)
-                }
-            }
-
-            data.data?.let { uris.add(it) }
-
-            otherFiles.clear()
-            successfulFiles.clear()
-            failedFiles.clear()
-
-            for (uri in uris) {
-                if (uri == template?.uri) continue
-
-                keepPermission(uri, data)
-
-                val name = queryName(uri) ?: "Unknown file"
-                otherFiles.add(PickedFile(uri, name, name))
-            }
-
-            status.text = "${otherFiles.size} files selected."
-        }
-
-        refreshUi()
-    }
-
-    private fun keepPermission(uri: Uri, data: Intent) {
-        val flags = data.flags and (
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-            Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-        )
+        val uri = data.data!!
 
         try {
+            val flags = data.flags and (
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
             contentResolver.takePersistableUriPermission(uri, flags)
-        } catch (_: Exception) {
-            // Provider may not support persistent permissions.
+        } catch (e: Exception) {
+            status.text = "Folder permission error: ${e.message}"
+            return
         }
+
+        folderUri = uri
+        selected.clear()
+        uploadedReady.clear()
+        loadFolder()
     }
 
-    private fun queryName(uri: Uri): String? {
-        var cursor: android.database.Cursor? = null
+    private fun loadFolder() {
+        val tree = folderUri ?: return
 
-        return try {
-            cursor = contentResolver.query(
-                uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME),
+        files.clear()
+
+        try {
+            val documentId = DocumentsContract.getTreeDocumentId(tree)
+            val childrenUri =
+                DocumentsContract.buildChildDocumentsUriUsingTree(
+                    tree, documentId
+                )
+
+            val cursor = contentResolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE
+                ),
                 null, null, null
             )
 
-            if (cursor != null && cursor.moveToFirst()) {
-                cursor.getString(0)
-            } else null
-        } catch (_: Exception) {
-            null
-        } finally {
-            cursor?.close()
+            cursor?.use {
+                while (it.moveToNext()) {
+                    val id = it.getString(0)
+                    val name = it.getString(1)
+                    val mime = it.getString(2)
+
+                    if (mime != DocumentsContract.Document.MIME_TYPE_DIR) {
+                        val uri =
+                            DocumentsContract.buildDocumentUriUsingTree(
+                                tree, id
+                            )
+                        files.add(FileItem(uri, name, mime))
+                    }
+                }
+            }
+
+            folderLabel.text = "Folder selected · ${files.size} files"
+            status.text = "Select files in the order you want numbered."
+            renderFiles()
+
+        } catch (e: Exception) {
+            status.text = "Could not read folder: ${e.message}"
         }
+    }
+
+    private fun renderFiles() {
+        fileList.removeAllViews()
+
+        if (files.isEmpty()) {
+            fileList.addView(label("No files found in this folder.", 13f, muted))
+            return
+        }
+
+        files.forEach { file ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(5), 0, dp(5))
+            }
+
+            val checkbox = CheckBox(this).apply {
+                text = file.name
+                textSize = 12f
+                setTextColor(ink)
+                isChecked = selected.containsKey(file.uri)
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked) {
+                        selected[file.uri] = file
+                    } else {
+                        selected.remove(file.uri)
+                    }
+                    updatePreview()
+                }
+            }
+
+            row.addView(
+                checkbox,
+                LinearLayout.LayoutParams(-1, -2)
+            )
+
+            fileList.addView(row)
+        }
+
+        updatePreview()
     }
 
     private fun extension(name: String): String {
@@ -305,164 +354,183 @@ class MainActivity : Activity() {
             name.substring(dot) else ""
     }
 
-    private fun baseName(name: String): String {
-        val ext = extension(name)
-        val base = if (ext.isNotEmpty()) name.dropLast(ext.length) else name
-
-        return base
-            .replace(Regex("\\s+\\d+$"), "")
+    private fun cleanBase(): String {
+        return filenameInput.text.toString()
             .trim()
-            .ifEmpty { base }
+            .replace(Regex("[/\\\\:*?\"<>|]"), "_")
+            .trim('.')
     }
 
-    private fun generatedName(index: Int, file: PickedFile): String {
-        val source = template ?: return file.originalName
-
-        return "${baseName(source.originalName)} $index${extension(file.originalName)}"
+    private fun targetName(index: Int, file: FileItem): String {
+        return "${cleanBase()} $index${extension(file.name)}"
     }
 
-    private fun refreshUi() {
-        templateText.text = template?.originalName ?: "No template selected"
+    private fun updatePreview() {
+        if (!::preview.isInitialized) return
 
-        selectedText.text =
-            if (otherFiles.isEmpty()) "No additional files selected"
-            else "${otherFiles.size} additional files selected"
+        val base = cleanBase()
 
-        preview.removeAllViews()
-
-        template?.let {
-            addPreviewRow("01", it.originalName, green)
-        }
-
-        otherFiles.forEachIndexed { index, file ->
-            addPreviewRow(
-                (index + 2).toString().padStart(2, '0'),
-                generatedName(index + 2, file),
-                accent
-            )
-        }
-
-        renameButton.isEnabled = template != null && otherFiles.isNotEmpty()
-        renameButton.alpha = if (renameButton.isEnabled) 1f else 0.45f
-
-        uploadButton.isEnabled = successfulFiles.isNotEmpty()
-        uploadButton.alpha = if (uploadButton.isEnabled) 1f else 0.45f
-    }
-
-    private fun addPreviewRow(number: String, filename: String, color: Int) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, dp(10))
-        }
-
-        val numberText = text(number, 11f, color, true)
-        row.addView(numberText)
-
-        val nameText = text(filename, 12f, ink)
-        nameText.maxLines = 3
-        nameText.setPadding(dp(14), 0, 0, 0)
-
-        row.addView(
-            nameText,
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
-
-        preview.addView(row)
-
-        val divider = View(this).apply {
-            setBackgroundColor(Color.rgb(235, 236, 240))
-        }
-
-        preview.addView(
-            divider,
-            LinearLayout.LayoutParams(-1, dp(1))
-        )
-    }
-
-    private fun renameAll() {
-        if (template == null || otherFiles.isEmpty()) return
-
-        successfulFiles.clear()
-        failedFiles.clear()
-
-        otherFiles.forEachIndexed { index, file ->
-            val newName = generatedName(index + 2, file)
-
-            try {
-                val newUri = DocumentsContract.renameDocument(
-                    contentResolver,
-                    file.uri,
-                    newName
-                )
-
-                if (newUri != null) {
-                    file.uri = newUri
-                    file.displayName = newName
-                    successfulFiles.add(file)
-                } else {
-                    failedFiles.add("${file.originalName}: Provider returned no result")
-                }
-            } catch (e: Exception) {
-                failedFiles.add(
-                    "${file.originalName}: ${e.message ?: e.javaClass.simpleName}"
-                )
-            }
-        }
-
-        val result = "Renamed: ${successfulFiles.size}  |  Failed: ${failedFiles.size}"
-
-        status.text = result
-        status.setTextColor(if (failedFiles.isEmpty()) green else red)
-
-        refreshUi()
-        showResults()
-    }
-
-    private fun showResults() {
-        val details = StringBuilder()
-
-        details.append("Successful: ${successfulFiles.size}\n")
-        successfulFiles.forEach {
-            details.append("✓ ${it.displayName}\n")
-        }
-
-        details.append("\nFailed: ${failedFiles.size}\n")
-        failedFiles.forEach {
-            details.append("• $it\n")
-        }
-
-        android.app.AlertDialog.Builder(this)
-            .setTitle("Rename results")
-            .setMessage(details.toString())
-            .setPositiveButton("OK", null)
-            .show()
-    }
-
-    private fun uploadToFtpRush() {
-        val files = successfulFiles.toList()
-
-        if (files.isEmpty()) {
-            toast("No successfully renamed files to upload.")
+        if (base.isBlank() || selected.isEmpty()) {
+            preview.text = "Enter a filename and select files."
             return
         }
 
-        val uris = ArrayList<Uri>()
-        files.forEach { uris.add(it.uri) }
+        val result = selected.values.mapIndexed { index, file ->
+            targetName(index + 1, file)
+        }
+
+        preview.text = result.joinToString("\n\n")
+    }
+
+    private fun renameFiles() {
+        val tree = folderUri ?: return
+        val base = cleanBase()
+        val chosen = selected.values.toList()
+
+        if (base.isBlank()) {
+            toast("Enter a filename first.")
+            return
+        }
+
+        if (chosen.isEmpty()) {
+            toast("Select at least one file.")
+            return
+        }
+
+        uploadedReady.clear()
+
+        val existingNames = files.map { it.name }.toMutableSet()
+        var copied = 0
+        var deleted = 0
+        val errors = mutableListOf<String>()
+
+        chosen.forEachIndexed { index, file ->
+            val name = targetName(index + 1, file)
+
+            if (name in existingNames && name != file.name) {
+                errors.add("$name already exists")
+                return@forEachIndexed
+            }
+
+            try {
+                val outputUri = DocumentsContract.createDocument(
+                    contentResolver,
+                    tree,
+                    file.mime.ifBlank { "application/octet-stream" },
+                    name
+                ) ?: throw IOException("Could not create destination file")
+
+                try {
+                    val input = contentResolver.openInputStream(file.uri)
+                        ?: throw IOException("Cannot read original file")
+
+                    val output = contentResolver.openOutputStream(outputUri)
+                        ?: throw IOException("Cannot write destination file")
+
+                    var bytes = 0L
+
+                    input.use { source ->
+                        output.use { destination ->
+                            val buffer = ByteArray(64 * 1024)
+                            while (true) {
+                                val count = source.read(buffer)
+                                if (count < 0) break
+                                destination.write(buffer, 0, count)
+                                bytes += count
+                            }
+                            destination.flush()
+                        }
+                    }
+
+                    val copiedSize = querySize(outputUri)
+
+                    if (copiedSize >= 0 && copiedSize != bytes) {
+                        throw IOException("Copy verification failed")
+                    }
+
+                    copied++
+                    existingNames.add(name)
+                    uploadedReady.add(outputUri)
+
+                    try {
+                        if (DocumentsContract.deleteDocument(
+                                contentResolver, file.uri
+                            )
+                        ) {
+                            deleted++
+                        } else {
+                            errors.add("$name copied, but original could not be deleted")
+                        }
+                    } catch (e: Exception) {
+                        errors.add("$name copied, but original could not be deleted: ${e.message}")
+                    }
+
+                } catch (e: Exception) {
+                    try {
+                        DocumentsContract.deleteDocument(contentResolver, outputUri)
+                    } catch (_: Exception) {}
+                    throw e
+                }
+
+            } catch (e: Exception) {
+                errors.add("${file.name}: ${e.message ?: "Unknown error"}")
+            }
+        }
+
+        status.text = "Created: $copied · Originals deleted: $deleted · Issues: ${errors.size}"
+        status.setTextColor(if (errors.isEmpty()) green else red)
+
+        if (errors.isNotEmpty()) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Rename results")
+                .setMessage(
+                    "Created: $copied\nOriginals deleted: $deleted\n\n" +
+                    errors.joinToString("\n\n")
+                )
+                .setPositiveButton("OK", null)
+                .show()
+        } else {
+            toast("Successfully renamed $copied files.")
+        }
+
+        loadFolder()
+    }
+
+    private fun querySize(uri: Uri): Long {
+        return try {
+            contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.SIZE),
+                null, null, null
+            )?.use {
+                if (it.moveToFirst() && !it.isNull(0)) it.getLong(0)
+                else -1L
+            } ?: -1L
+        } catch (_: Exception) {
+            -1L
+        }
+    }
+
+    private fun uploadFiles() {
+        if (uploadedReady.isEmpty()) {
+            toast("Rename files before uploading.")
+            return
+        }
+
+        val uris = ArrayList(uploadedReady)
 
         val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
             type = "*/*"
             putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
             clipData = android.content.ClipData.newUri(
                 contentResolver,
-                "Renamed files",
+                "BatchRename files",
                 uris.first()
             ).apply {
                 for (i in 1 until uris.size) {
-                    addItem(
-                        android.content.ClipData.Item(uris[i])
-                    )
+                    addItem(android.content.ClipData.Item(uris[i]))
                 }
             }
         }
@@ -476,16 +544,16 @@ class MainActivity : Activity() {
                 startActivity(ftpIntent)
             } else {
                 startActivity(
-                    Intent.createChooser(intent, "Send files to FTP Rush")
+                    Intent.createChooser(intent, "Upload renamed files")
                 )
             }
         } catch (e: Exception) {
             try {
                 startActivity(
-                    Intent.createChooser(intent, "Share renamed files")
+                    Intent.createChooser(intent, "Share files")
                 )
             } catch (_: Exception) {
-                toast("Unable to share files.")
+                toast("Could not open FTP Rush.")
             }
         }
     }

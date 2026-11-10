@@ -10,7 +10,10 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.content.res.ColorStateList
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.Point
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
@@ -31,18 +34,20 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
-import android.widget.AdapterView
 import android.widget.BaseAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
+import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -50,12 +55,11 @@ import java.util.concurrent.Executors
 class MainActivity : Activity() {
 
     private companion object {
-        const val REQ_PICK_FOLDER = 4101
+        const val REQ_PICK_FILES = 4102
         const val PREFS_NAME = "batchrename_prefs"
-        const val KEY_TREE_URI = "tree_uri"
         const val KEY_BASE_NAME = "base_name"
         const val KEY_START_AT = "start_at"
-        const val STATE_SELECTION = "selection_order"
+        const val STATE_URIS = "selected_uris"
         const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
     }
@@ -72,8 +76,8 @@ class MainActivity : Activity() {
     private val cHair = Color.parseColor("#E6E2DB")
     private val cHairStrong = Color.parseColor("#D3CEC5")
     private val cAccent = Color.parseColor("#6B4E9E")
-    private val cAccentSoft = Color.parseColor("#33" + "6B4E9E")
-    private val cAccentRow = Color.parseColor("#F1ECF8")
+    private val cAccentSoft = Color.parseColor("#336B4E9E")
+    private val cAccentTile = Color.parseColor("#EFEAF4")
     private val cAccentRipple = Color.parseColor("#1F6B4E9E")
     private val cWhiteRipple = Color.parseColor("#33FFFFFF")
     private val cError = Color.parseColor("#9A3B3B")
@@ -89,31 +93,24 @@ class MainActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
+    private val thumbWorker: ExecutorService = Executors.newFixedThreadPool(2)
     private lateinit var prefs: SharedPreferences
 
-    private var treeUri: Uri? = null
-    private var folderName: String = ""
-    private val files = ArrayList<DocEntry>()
-    private val allNamesLower = HashSet<String>()
-    private val selectedIds = ArrayList<String>()
-    private val orderMap = HashMap<String, Int>()
+    private val items = ArrayList<Item>()
     private var busy = false
-    private var loading = false
-    private var loadToken = 0
     private var curBase = ""
     private var curStart = 1L
 
     // Views
-    private lateinit var folderCard: LinearLayout
-    private lateinit var folderNameView: TextView
-    private lateinit var folderMetaView: TextView
-    private lateinit var chooseBtn: TextView
+    private lateinit var pickCard: LinearLayout
+    private lateinit var pickTitleView: TextView
+    private lateinit var pickMetaView: TextView
+    private lateinit var pickPill: TextView
     private lateinit var baseEdit: EditText
     private lateinit var startEdit: EditText
     private lateinit var previewView: TextView
-    private lateinit var selectionCountView: TextView
-    private lateinit var selectAllBtn: TextView
     private lateinit var clearBtn: TextView
+    private lateinit var orderHintView: TextView
     private lateinit var listView: ListView
     private lateinit var emptyText: TextView
     private lateinit var statusText: TextView
@@ -136,42 +133,49 @@ class MainActivity : Activity() {
         baseEdit.setText(prefs.getString(KEY_BASE_NAME, "") ?: "")
         startEdit.setText(prefs.getString(KEY_START_AT, "1") ?: "1")
         attachWatchers()
-
-        val restored = savedInstanceState?.getStringArrayList(STATE_SELECTION)
         refreshUi()
-        restoreLastFolder(restored)
+
+        val saved = savedInstanceState?.getStringArrayList(STATE_URIS)
+        if (saved != null && saved.isNotEmpty()) {
+            val uris = ArrayList<Uri>()
+            for (s in saved) uris.add(Uri.parse(s))
+            addUris(uris)
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putStringArrayList(STATE_SELECTION, ArrayList(selectedIds))
+        val uris = ArrayList<String>()
+        for (item in items) uris.add(item.uri.toString())
+        outState.putStringArrayList(STATE_URIS, uris)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         // Graceful: lets a rename that is already running finish instead of interrupting it.
         worker.shutdown()
+        thumbWorker.shutdownNow()
     }
 
     @Suppress("DEPRECATION")
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQ_PICK_FOLDER || resultCode != RESULT_OK) return
-        val uri = data?.data ?: return
-        try {
-            contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            )
-        } catch (e: SecurityException) {
-            // Permission could not be persisted; it remains valid for this session.
+        if (requestCode != REQ_PICK_FILES || resultCode != RESULT_OK || data == null) return
+
+        // Preserve exactly the order in which the picker returns the selection.
+        val uris = ArrayList<Uri>()
+        val clip = data.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) {
+                val u = clip.getItemAt(i).uri
+                if (u != null) uris.add(u)
+            }
+        } else {
+            val single = data.data
+            if (single != null) uris.add(single)
         }
-        treeUri = uri
-        prefs.edit().putString(KEY_TREE_URI, uri.toString()).apply()
-        selectedIds.clear()
-        setStatus(null)
-        loadFolder(uri, null)
+        addUris(uris)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -229,6 +233,15 @@ class MainActivity : Activity() {
     private fun textAction(text: String): TextView {
         val t = makeText(text, 12.5f, cAccent, sansMedium)
         t.setPadding(dp(8), dp(10), dp(8), dp(10))
+        t.isClickable = true
+        t.isFocusable = true
+        t.background = ripple(shape(Color.TRANSPARENT, 8), cAccentRipple)
+        return t
+    }
+
+    private fun control(label: String): TextView {
+        val t = makeText(label, 17f, cMuted, sans)
+        t.gravity = Gravity.CENTER
         t.isClickable = true
         t.isFocusable = true
         t.background = ripple(shape(Color.TRANSPARENT, 8), cAccentRipple)
@@ -295,41 +308,41 @@ class MainActivity : Activity() {
         panel.addView(title, lp(MATCH, WRAP, top = dp(10)))
 
         val subtitle = makeText(
-            "Choose a folder, select files in the order you want, and apply one consistent name.",
+            "Pick files with the Android Files app, set one base name, and number them in order.",
             13f, cMuted, sansLight
         )
         subtitle.setLineSpacing(0f, 1.2f)
         panel.addView(subtitle, lp(MATCH, WRAP, top = dp(8)))
 
-        // ---- Folder card --------------------------------------------------------------------
-        folderCard = LinearLayout(this)
-        folderCard.orientation = LinearLayout.HORIZONTAL
-        folderCard.gravity = Gravity.CENTER_VERTICAL
-        folderCard.setPadding(dp(18), dp(14), dp(12), dp(14))
-        folderCard.isClickable = true
-        folderCard.isFocusable = true
-        folderCard.background = ripple(shape(cCard, 16, cHair, hair()), cAccentRipple)
-        folderCard.setOnClickListener { if (!busy) pickFolder() }
+        // ---- File picker card ---------------------------------------------------------------
+        pickCard = LinearLayout(this)
+        pickCard.orientation = LinearLayout.HORIZONTAL
+        pickCard.gravity = Gravity.CENTER_VERTICAL
+        pickCard.setPadding(dp(18), dp(14), dp(12), dp(14))
+        pickCard.isClickable = true
+        pickCard.isFocusable = true
+        pickCard.background = ripple(shape(cCard, 16, cHair, hair()), cAccentRipple)
+        pickCard.setOnClickListener { if (!busy) pickFiles() }
 
-        val folderCol = LinearLayout(this)
-        folderCol.orientation = LinearLayout.VERTICAL
-        folderCol.addView(eyebrow("Folder"), lp(WRAP, WRAP))
-        folderNameView = makeText("No folder selected", 16f, cInk, sansMedium)
-        folderNameView.maxLines = 1
-        folderNameView.ellipsize = TextUtils.TruncateAt.END
-        folderCol.addView(folderNameView, lp(MATCH, WRAP, top = dp(6)))
-        folderMetaView = makeText("Choose a folder to begin", 12.5f, cMuted, sans)
-        folderMetaView.maxLines = 1
-        folderMetaView.ellipsize = TextUtils.TruncateAt.END
-        folderCol.addView(folderMetaView, lp(MATCH, WRAP, top = dp(3)))
-        folderCard.addView(folderCol, lp(0, WRAP, 1f))
+        val pickCol = LinearLayout(this)
+        pickCol.orientation = LinearLayout.VERTICAL
+        pickCol.addView(eyebrow("Files"), lp(WRAP, WRAP))
+        pickTitleView = makeText("No files selected", 16f, cInk, sansMedium)
+        pickTitleView.maxLines = 1
+        pickTitleView.ellipsize = TextUtils.TruncateAt.END
+        pickCol.addView(pickTitleView, lp(MATCH, WRAP, top = dp(6)))
+        pickMetaView = makeText("", 12.5f, cMuted, sans)
+        pickMetaView.maxLines = 2
+        pickMetaView.ellipsize = TextUtils.TruncateAt.END
+        pickCol.addView(pickMetaView, lp(MATCH, WRAP, top = dp(3)))
+        pickCard.addView(pickCol, lp(0, WRAP, 1f))
 
-        chooseBtn = makeText("Choose", 13f, cAccent, sansMedium)
-        chooseBtn.setPadding(dp(14), dp(10), dp(14), dp(10))
-        chooseBtn.background = shape(Color.parseColor("#F0EBF7"), 20)
-        folderCard.addView(chooseBtn, lp(WRAP, WRAP, left = dp(10)))
+        pickPill = makeText("Add files", 13f, cAccent, sansMedium)
+        pickPill.setPadding(dp(14), dp(10), dp(14), dp(10))
+        pickPill.background = shape(cAccentTile, 20)
+        pickCard.addView(pickPill, lp(WRAP, WRAP, left = dp(10)))
 
-        panel.addView(folderCard, lp(MATCH, WRAP, top = dp(20)))
+        panel.addView(pickCard, lp(MATCH, WRAP, top = dp(20)))
 
         // ---- Name card ----------------------------------------------------------------------
         val nameCard = LinearLayout(this)
@@ -394,31 +407,26 @@ class MainActivity : Activity() {
         listHeader.orientation = LinearLayout.HORIZONTAL
         listHeader.gravity = Gravity.CENTER_VERTICAL
         listHeader.setPadding(dp(24), dp(14), dp(16), dp(0))
-        listHeader.addView(eyebrow("Files", cInk), lp(WRAP, WRAP))
-        selectionCountView = makeText("0 of 0 selected", 12.5f, cMuted, sans)
-        selectionCountView.maxLines = 1
-        listHeader.addView(selectionCountView, lp(0, WRAP, 1f, left = dp(10)))
-        selectAllBtn = textAction("Select all")
-        selectAllBtn.setOnClickListener { selectAll() }
-        listHeader.addView(selectAllBtn, lp(WRAP, WRAP))
-        clearBtn = textAction("Clear")
-        clearBtn.setOnClickListener { clearSelection() }
+        listHeader.addView(eyebrow("Order", cInk), lp(WRAP, WRAP))
+        orderHintView = makeText("", 12.5f, cMuted, sans)
+        orderHintView.maxLines = 1
+        orderHintView.ellipsize = TextUtils.TruncateAt.END
+        listHeader.addView(orderHintView, lp(0, WRAP, 1f, left = dp(10)))
+        clearBtn = textAction("Clear all")
+        clearBtn.setOnClickListener { clearAll() }
         listHeader.addView(clearBtn, lp(WRAP, WRAP))
         root.addView(listHeader, lp(MATCH, WRAP))
 
-        // ---- File list ----------------------------------------------------------------------
+        // ---- Ordered list -------------------------------------------------------------------
         val listFrame = FrameLayout(this)
         listView = ListView(this)
         listView.divider = null
         listView.dividerHeight = 0
-        listView.selector = ColorDrawable(Color.parseColor("#12" + "6B4E9E"))
+        listView.selector = ColorDrawable(Color.TRANSPARENT)
         listView.setBackgroundColor(Color.TRANSPARENT)
         listView.isVerticalScrollBarEnabled = true
         adapter = FileAdapter()
         listView.adapter = adapter
-        listView.onItemClickListener = AdapterView.OnItemClickListener { _, _, position, _ ->
-            toggleSelection(position)
-        }
         listFrame.addView(listView, FrameLayout.LayoutParams(MATCH, MATCH))
 
         emptyText = makeText("", 14f, cMuted, sansLight)
@@ -448,7 +456,7 @@ class MainActivity : Activity() {
         buttonRow.setPadding(dp(24), dp(12), dp(24), dp(16))
 
         shareBtn = button("Share to FTP Rush", false)
-        shareBtn.setOnClickListener { shareSelected() }
+        shareBtn.setOnClickListener { shareAll() }
         buttonRow.addView(shareBtn, lp(0, WRAP, 1f, right = dp(6)))
 
         renameBtn = button("Rename", true)
@@ -551,8 +559,8 @@ class MainActivity : Activity() {
         return name.substring(dot)
     }
 
-    private fun targetNameFor(order: Int, entry: DocEntry): String =
-        curBase + " " + (curStart + order) + extensionOf(entry.name)
+    private fun targetNameFor(order: Int, item: Item): String =
+        curBase + " " + (curStart + order) + extensionOf(item.name)
 
     private fun plural(n: Int, word: String): String = if (n == 1) "1 $word" else "$n ${word}s"
 
@@ -567,35 +575,6 @@ class MainActivity : Activity() {
             i++
         }
         return String.format(Locale.getDefault(), "%.1f %s", v, units[i])
-    }
-
-    private fun naturalCompare(a: String, b: String): Int {
-        var i = 0
-        var j = 0
-        while (i < a.length && j < b.length) {
-            val ca = a[i]
-            val cb = b[j]
-            if (ca.isDigit() && cb.isDigit()) {
-                var ei = i
-                while (ei < a.length && a[ei].isDigit()) ei++
-                var ej = j
-                while (ej < b.length && b[ej].isDigit()) ej++
-                val na = a.substring(i, ei).trimStart('0')
-                val nb = b.substring(j, ej).trimStart('0')
-                if (na.length != nb.length) return na.length - nb.length
-                val cmp = na.compareTo(nb)
-                if (cmp != 0) return cmp
-                i = ei
-                j = ej
-            } else {
-                val la = Character.toLowerCase(ca)
-                val lb = Character.toLowerCase(cb)
-                if (la != lb) return la.compareTo(lb)
-                i++
-                j++
-            }
-        }
-        return (a.length - i) - (b.length - j)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -613,60 +592,52 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun rebuildOrderMap() {
-        orderMap.clear()
-        for ((i, id) in selectedIds.withIndex()) {
-            orderMap[id] = i
-        }
-    }
-
-    private fun selectedEntries(): List<DocEntry> {
-        val byId = HashMap<String, DocEntry>()
-        for (f in files) byId[f.docId] = f
-        val out = ArrayList<DocEntry>()
-        for (id in selectedIds) {
-            val e = byId[id]
-            if (e != null) out.add(e)
-        }
-        return out
-    }
-
     private fun refreshUi() {
-        rebuildOrderMap()
         curBase = sanitize(baseEdit.text.toString())
         curStart = startNumber()
 
-        val hasFolder = treeUri != null
-        folderNameView.text = if (hasFolder) {
-            if (folderName.isEmpty()) "Selected folder" else folderName
+        val count = items.size
+
+        // File card
+        if (count == 0) {
+            pickTitleView.text = "No files selected"
+            pickMetaView.text = "Browse internal storage, Downloads, DCIM, Movies, WhatsApp and more."
+            pickPill.text = "Add files"
         } else {
-            "No folder selected"
+            pickTitleView.text = plural(count, "file") + " selected"
+            var total = 0L
+            var known = true
+            for (item in items) {
+                if (item.size >= 0L) total += item.size else known = false
+            }
+            pickMetaView.text = if (known || total > 0L) {
+                formatSize(total) + " in total. Tap to add more."
+            } else {
+                "Tap to add more files."
+            }
+            pickPill.text = "Add more"
         }
-        folderMetaView.text = when {
-            loading -> "Reading folder…"
-            !hasFolder -> "Choose a folder to begin"
-            else -> plural(files.size, "file")
-        }
-        chooseBtn.text = if (hasFolder) "Change" else "Choose"
-        selectionCountView.text = "${selectedIds.size} of ${files.size} selected"
+
+        orderHintView.text = if (count > 1) "Use the arrows to adjust" else ""
+        clearBtn.visibility = if (count > 0) View.VISIBLE else View.GONE
 
         // Preview line
         if (curBase.isEmpty()) {
             previewView.text = "Enter a base name to see a preview"
             previewView.setTextColor(cFaint)
         } else {
-            val sample = selectedEntries().firstOrNull()
-            val ext = if (sample != null) extensionOf(sample.name) else ""
+            val first = items.firstOrNull()
+            val ext = if (first != null) extensionOf(first.name) else ""
             previewView.text = "Preview   $curBase $curStart$ext"
             previewView.setTextColor(cAccent)
         }
 
         // Empty state
-        if (files.isEmpty()) {
-            emptyText.text = when {
-                loading -> "Reading folder…"
-                !hasFolder -> "No folder yet.\nChoose one to see its files."
-                else -> "This folder contains no files."
+        if (items.isEmpty()) {
+            emptyText.text = if (busy) {
+                "Reading selection…"
+            } else {
+                "Your selection will appear here, numbered in order.\nTap Add files to open the Files app."
             }
             emptyText.visibility = View.VISIBLE
         } else {
@@ -674,184 +645,170 @@ class MainActivity : Activity() {
         }
 
         // Buttons
-        val count = selectedIds.size
-        val canRename = !busy && !loading && count > 0 && curBase.isNotEmpty()
+        val canRename = !busy && count > 0 && curBase.isNotEmpty()
         renameBtn.text = if (count > 0) "Rename " + plural(count, "file") else "Rename"
         renameBtn.isEnabled = canRename
         renameBtn.alpha = if (canRename) 1f else 0.4f
         val canShare = !busy && count > 0
         shareBtn.isEnabled = canShare
         shareBtn.alpha = if (canShare) 1f else 0.4f
-        folderCard.isEnabled = !busy
-        selectAllBtn.isEnabled = !busy
+        pickCard.isEnabled = !busy
         clearBtn.isEnabled = !busy
 
         adapter.notifyDataSetChanged()
     }
 
-    private fun toggleSelection(position: Int) {
+    private fun clearAll() {
         if (busy) return
-        val entry = files.getOrNull(position) ?: return
-        val idx = selectedIds.indexOf(entry.docId)
-        if (idx >= 0) selectedIds.removeAt(idx) else selectedIds.add(entry.docId)
-        hideKeyboard()
+        items.clear()
+        setStatus(null)
         refreshUi()
     }
 
-    private fun selectAll() {
+    private fun moveItem(item: Item, delta: Int) {
         if (busy) return
-        val present = HashSet<String>(selectedIds)
-        for (f in files) {
-            if (present.add(f.docId)) selectedIds.add(f.docId)
-        }
+        val from = items.indexOf(item)
+        val to = from + delta
+        if (from < 0 || to < 0 || to >= items.size) return
+        Collections.swap(items, from, to)
         refreshUi()
     }
 
-    private fun clearSelection() {
+    private fun removeItem(item: Item) {
         if (busy) return
-        selectedIds.clear()
+        items.remove(item)
         refreshUi()
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Folder selection and listing (Storage Access Framework)
+    // File selection (native Android Files picker)
     // ---------------------------------------------------------------------------------------------
 
     @Suppress("DEPRECATION")
-    private fun pickFolder() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+    private fun pickFiles() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.type = "*/*"
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         intent.addFlags(
             Intent.FLAG_GRANT_READ_URI_PERMISSION or
                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
         )
-        val current = treeUri
-        if (current != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, current)
-        }
         try {
-            startActivityForResult(intent, REQ_PICK_FOLDER)
+            startActivityForResult(intent, REQ_PICK_FILES)
         } catch (e: Exception) {
-            Toast.makeText(this, "No folder picker is available on this device.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "The Android Files app is not available on this device.", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun restoreLastFolder(restoredSelection: List<String>?) {
-        val saved = prefs.getString(KEY_TREE_URI, null) ?: return
-        val uri = try {
-            Uri.parse(saved)
-        } catch (e: Exception) {
-            return
-        }
-        var permitted = false
-        for (p in contentResolver.persistedUriPermissions) {
-            if (p.uri == uri && p.isReadPermission && p.isWritePermission) {
-                permitted = true
-                break
-            }
-        }
-        if (!permitted) return
-        treeUri = uri
-        loadFolder(uri, restoredSelection)
-    }
-
-    private fun queryDisplayName(tree: Uri, docId: String): String? {
-        return try {
-            val docUri = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
-            val cursor = contentResolver.query(
-                docUri,
-                arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
-                null, null, null
-            )
+    /** Reads name, type, size and capability flags for a picked document. Returns null if access was denied. */
+    private fun describe(uri: Uri): Item? {
+        var name: String? = null
+        var mime = ""
+        var size = -1L
+        var flags = 0
+        try {
+            val cursor = contentResolver.query(uri, null, null, null, null)
             cursor?.use { c ->
-                if (c.moveToFirst() && !c.isNull(0)) c.getString(0) else null
+                if (c.moveToFirst()) {
+                    val iName = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val iMime = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val iSize = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                    val iFlags = c.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+                    if (iName >= 0 && !c.isNull(iName)) name = c.getString(iName)
+                    if (iMime >= 0 && !c.isNull(iMime)) mime = c.getString(iMime)
+                    if (iSize >= 0 && !c.isNull(iSize)) size = c.getLong(iSize)
+                    if (iFlags >= 0 && !c.isNull(iFlags)) flags = c.getInt(iFlags)
+                }
             }
+        } catch (e: SecurityException) {
+            return null
         } catch (e: Exception) {
-            null
+            // Keep whatever could be read; fall back to defaults below.
         }
+        if (mime.isEmpty()) {
+            mime = try {
+                contentResolver.getType(uri) ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+        }
+        val finalName = name ?: uri.lastPathSegment ?: "file"
+        val isDoc = try {
+            DocumentsContract.isDocumentUri(this, uri)
+        } catch (e: Exception) {
+            false
+        }
+        val renamable = isDoc && (flags and DocumentsContract.Document.FLAG_SUPPORTS_RENAME) != 0
+        val thumbs = (flags and DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL) != 0
+        return Item(uri, finalName, mime, size, renamable, thumbs)
     }
 
-    private fun loadFolder(tree: Uri, restoreSelection: List<String>?) {
-        loading = true
-        loadToken += 1
-        val token = loadToken
+    private fun addUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val known = HashSet<String>()
+        for (item in items) known.add(item.uri.toString())
+
+        busy = true
+        setStatus("Reading selection…")
         refreshUi()
 
         worker.execute {
-            val list = ArrayList<DocEntry>()
-            val names = HashSet<String>()
-            var displayName = ""
-            var errorMessage: String? = null
-            try {
-                val treeDocId = DocumentsContract.getTreeDocumentId(tree)
-                displayName = queryDisplayName(tree, treeDocId) ?: treeDocId.substringAfterLast(':')
-                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, treeDocId)
-                val projection = arrayOf(
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE,
-                    DocumentsContract.Document.COLUMN_SIZE,
-                    DocumentsContract.Document.COLUMN_FLAGS
-                )
-                val cursor = contentResolver.query(childrenUri, projection, null, null, null)
-                    ?: throw IllegalStateException("The storage provider returned no data.")
-                cursor.use { c ->
-                    val iId = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                    val iName = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                    val iMime = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                    val iSize = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
-                    val iFlags = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_FLAGS)
-                    while (c.moveToNext()) {
-                        if (c.isNull(iId) || c.isNull(iName)) continue
-                        val docId = c.getString(iId)
-                        val name = c.getString(iName)
-                        val mime = if (c.isNull(iMime)) "" else c.getString(iMime)
-                        val size = if (c.isNull(iSize)) -1L else c.getLong(iSize)
-                        val flags = if (c.isNull(iFlags)) 0 else c.getInt(iFlags)
-                        names.add(name.lowercase(Locale.ROOT))
-                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) continue
-                        list.add(
-                            DocEntry(
-                                docId,
-                                DocumentsContract.buildDocumentUriUsingTree(tree, docId),
-                                name, mime, size, flags
-                            )
-                        )
-                    }
+            val built = ArrayList<Item>()
+            var duplicates = 0
+            var denied = 0
+            for (u in uris) {
+                if (!known.add(u.toString())) {
+                    duplicates++
+                    continue
                 }
-                list.sortWith(Comparator { a, b -> naturalCompare(a.name, b.name) })
-            } catch (e: Exception) {
-                errorMessage = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+                val item = describe(u)
+                if (item != null) built.add(item) else denied++
             }
-
-            val finalError = errorMessage
-            val finalName = displayName
             ui.post {
-                if (!isFinishing && !isDestroyed && token == loadToken) {
-                    loading = false
-                    files.clear()
-                    allNamesLower.clear()
-                    selectedIds.clear()
-                    if (finalError != null) {
-                        folderName = finalName
-                        setStatus("Could not read this folder: $finalError", true)
-                    } else {
-                        folderName = finalName
-                        files.addAll(list)
-                        allNamesLower.addAll(names)
-                        if (restoreSelection != null) {
-                            val present = HashSet<String>()
-                            for (f in list) present.add(f.docId)
-                            val seen = HashSet<String>()
-                            for (id in restoreSelection) {
-                                if (present.contains(id) && seen.add(id)) selectedIds.add(id)
-                            }
-                        }
-                    }
+                busy = false
+                if (!isFinishing && !isDestroyed) {
+                    items.addAll(built)
+                    val notes = ArrayList<String>()
+                    if (duplicates > 0) notes.add(plural(duplicates, "file") + " already in the list " + (if (duplicates == 1) "was" else "were") + " skipped")
+                    if (denied > 0) notes.add(plural(denied, "file") + " could not be accessed")
+                    setStatus(if (notes.isEmpty()) null else notes.joinToString(". ") + ".", denied > 0)
                     refreshUi()
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Thumbnails
+    // ---------------------------------------------------------------------------------------------
+
+    private fun loadThumbnail(item: Item) {
+        if (item.thumbRequested || !item.supportsThumb) return
+        item.thumbRequested = true
+        val uri = item.uri
+        val side = dp(112)
+        try {
+            thumbWorker.execute {
+                var bmp: Bitmap? = null
+                try {
+                    bmp = DocumentsContract.getDocumentThumbnail(contentResolver, uri, Point(side, side), null)
+                } catch (e: Exception) {
+                    // No thumbnail available; the extension tile stays visible.
+                }
+                val result = bmp
+                if (result != null) {
+                    ui.post {
+                        if (!isFinishing && !isDestroyed) {
+                            item.thumb = result
+                            adapter.notifyDataSetChanged()
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Executor already shut down; nothing to do.
         }
     }
 
@@ -860,27 +817,29 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------------------------------------
 
     private fun startRename() {
-        if (busy || loading) return
+        if (busy) return
         refreshUi()
-        val base = curBase
-        if (base.isEmpty()) {
+        if (curBase.isEmpty()) {
             setStatus("Enter a base name before renaming.", true)
             return
         }
-        val selected = selectedEntries()
-        if (selected.isEmpty()) {
-            setStatus("Select at least one file.", true)
+        if (items.isEmpty()) {
+            setStatus("Add at least one file.", true)
             return
         }
 
         val all = ArrayList<RenameJob>()
-        for ((i, e) in selected.withIndex()) {
-            all.add(RenameJob(e, targetNameFor(i, e)))
+        for ((i, item) in items.withIndex()) {
+            all.add(RenameJob(item, targetNameFor(i, item)))
         }
 
         for (job in all) {
-            if ((job.entry.flags and DocumentsContract.Document.FLAG_SUPPORTS_RENAME) == 0) {
-                setStatus("This storage location does not allow renaming “${job.entry.name}”.", true)
+            if (!job.item.renamable) {
+                setStatus(
+                    "“${job.item.name}” comes from a source that does not allow renaming. " +
+                        "Remove it, then add it again by browsing Internal storage or Downloads instead of the Images or Videos shortcuts.",
+                    true
+                )
                 return
             }
             if (job.targetName.toByteArray(Charsets.UTF_8).size > 255) {
@@ -891,32 +850,20 @@ class MainActivity : Activity() {
 
         val active = ArrayList<RenameJob>()
         for (job in all) {
-            if (job.targetName != job.entry.name) active.add(job)
+            if (job.targetName != job.item.name) active.add(job)
         }
         if (active.isEmpty()) {
-            setStatus("The selected files already carry these names.", false)
+            setStatus("The files already carry these names.", false)
             return
         }
 
+        // If a new name equals another selected file's current name, rename through temporary names.
         val activeOriginals = HashSet<String>()
-        for (job in active) activeOriginals.add(job.entry.name.lowercase(Locale.ROOT))
-
-        val fixedNames = HashSet<String>(allNamesLower)
-        fixedNames.removeAll(activeOriginals)
-        for (job in active) {
-            if (fixedNames.contains(job.targetName.lowercase(Locale.ROOT))) {
-                setStatus(
-                    "“${job.targetName}” already exists in this folder. Change the base name or start number.",
-                    true
-                )
-                return
-            }
-        }
-
+        for (job in active) activeOriginals.add(job.item.name.lowercase(Locale.ROOT))
         var needsTemp = false
         for (job in active) {
             val t = job.targetName.lowercase(Locale.ROOT)
-            if (t != job.entry.name.lowercase(Locale.ROOT) && activeOriginals.contains(t)) {
+            if (t != job.item.name.lowercase(Locale.ROOT) && activeOriginals.contains(t)) {
                 needsTemp = true
                 break
             }
@@ -926,16 +873,16 @@ class MainActivity : Activity() {
         val first = active.first()
         val last = active.last()
         val example = if (active.size == 1) {
-            "“${first.entry.name}” becomes “${first.targetName}”."
+            "“${first.item.name}” becomes “${first.targetName}”."
         } else {
-            "“${first.entry.name}” becomes “${first.targetName}”, through to “${last.targetName}”."
+            "“${first.item.name}” becomes “${first.targetName}”, through to “${last.targetName}”."
         }
 
         AlertDialog.Builder(this)
             .setTitle("Rename " + plural(active.size, "file") + "?")
             .setMessage(
-                example + "\n\nFiles are renamed in place on the storage provider. " +
-                    "Nothing is copied or deleted, and any failure reverts every change."
+                example + "\n\nFiles are renamed in place. Nothing is copied or deleted, " +
+                    "and any failure reverts every change."
             )
             .setPositiveButton("Rename") { _, _ -> executeRename(active, useTemp) }
             .setNegativeButton("Cancel", null)
@@ -955,17 +902,19 @@ class MainActivity : Activity() {
                 }
             }
             ui.post {
+                // Each file's address changes when it is renamed, so always adopt the latest state.
+                for (job in jobs) {
+                    job.item.uri = job.currentUri
+                    job.item.name = job.currentName
+                }
                 busy = false
                 if (!isFinishing && !isDestroyed) {
-                    val tree = treeUri
                     if (failure == null) {
-                        selectedIds.clear()
                         setStatus("Renamed " + plural(jobs.size, "file") + " successfully.", false)
-                        if (tree != null) loadFolder(tree, null) else refreshUi()
                     } else {
                         setStatus(failure, true)
-                        if (tree != null) loadFolder(tree, ArrayList(selectedIds)) else refreshUi()
                     }
+                    refreshUi()
                 }
             }
         }
@@ -983,7 +932,7 @@ class MainActivity : Activity() {
             if (useTemp) {
                 for ((i, job) in jobs.withIndex()) {
                     current = job
-                    renameOne(job, "brtmp_" + stamp + "_" + i + extensionOf(job.entry.name))
+                    renameOne(job, "brtmp_" + stamp + "_" + i + extensionOf(job.item.name))
                     job.stage = 1
                 }
             }
@@ -995,7 +944,7 @@ class MainActivity : Activity() {
             }
             return null
         } catch (e: Exception) {
-            val failedAt = current?.entry?.name ?: "a file"
+            val failedAt = current?.item?.name ?: "a file"
             val unresolved = rollback(jobs, useTemp, stamp)
             val reason = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
             return if (unresolved == 0) {
@@ -1004,7 +953,7 @@ class MainActivity : Activity() {
                 "Renaming stopped at “$failedAt”: $reason. $unresolved " +
                     (if (unresolved == 1) "file" else "files") +
                     " could not be restored automatically and may carry a temporary name. " +
-                    "Open the folder to review. No file was deleted."
+                    "No file was deleted."
             }
         }
     }
@@ -1022,10 +971,10 @@ class MainActivity : Activity() {
             if (job.stage == 2) {
                 try {
                     if (useTemp) {
-                        renameOne(job, "brtmp_" + stamp + "_rb" + i + extensionOf(job.entry.name))
+                        renameOne(job, "brtmp_" + stamp + "_rb" + i + extensionOf(job.item.name))
                         job.stage = 1
                     } else {
-                        renameOne(job, job.entry.name)
+                        renameOne(job, job.item.name)
                         job.stage = 0
                     }
                 } catch (e: Exception) {
@@ -1036,7 +985,7 @@ class MainActivity : Activity() {
         for (job in jobs) {
             if (job.stage == 1) {
                 try {
-                    renameOne(job, job.entry.name)
+                    renameOne(job, job.item.name)
                     job.stage = 0
                 } catch (e: Exception) {
                     unresolved++
@@ -1082,19 +1031,18 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun shareSelected() {
+    private fun shareAll() {
         if (busy) return
-        val selected = selectedEntries()
-        if (selected.isEmpty()) {
-            setStatus("Select at least one file to share.", true)
+        if (items.isEmpty()) {
+            setStatus("Add at least one file to share.", true)
             return
         }
 
         val uris = ArrayList<Uri>()
         val mimes = ArrayList<String>()
-        for (e in selected) {
-            uris.add(e.uri)
-            mimes.add(if (e.mime.isEmpty()) "application/octet-stream" else e.mime)
+        for (item in items) {
+            uris.add(item.uri)
+            mimes.add(if (item.mime.isEmpty()) "application/octet-stream" else item.mime)
         }
 
         val intent = if (uris.size == 1) {
@@ -1141,9 +1089,9 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------------------------------------
 
     private inner class FileAdapter : BaseAdapter() {
-        override fun getCount(): Int = files.size
+        override fun getCount(): Int = items.size
 
-        override fun getItem(position: Int): Any = files[position]
+        override fun getItem(position: Int): Any = items[position]
 
         override fun getItemId(position: Int): Long = position.toLong()
 
@@ -1158,7 +1106,7 @@ class MainActivity : Activity() {
                 view = convertView
                 holder = convertView.tag as RowHolder
             }
-            bindRow(holder, files[position])
+            bindRow(holder, items[position], position)
             return view
         }
     }
@@ -1170,84 +1118,142 @@ class MainActivity : Activity() {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         row.gravity = Gravity.CENTER_VERTICAL
-        row.setPadding(dp(24), dp(13), dp(24), dp(13))
+        row.setPadding(dp(24), dp(12), dp(12), dp(12))
 
-        val badge = makeText("", 12f, Color.WHITE, sansMedium)
+        // Thumbnail tile with an order badge
+        val tile = FrameLayout(this)
+        tile.background = shape(cAccentTile, 10)
+
+        val extText = makeText("", 11f, cAccent, sansMedium)
+        extText.gravity = Gravity.CENTER
+        extText.letterSpacing = 0.06f
+        tile.addView(extText, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        val radius = dpf(10f)
+        val img = ImageView(this)
+        img.scaleType = ImageView.ScaleType.CENTER_CROP
+        img.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                outline.setRoundRect(0, 0, view.width, view.height, radius)
+            }
+        }
+        img.clipToOutline = true
+        img.visibility = View.GONE
+        tile.addView(img, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        val badge = makeText("", 10.5f, Color.WHITE, sansMedium)
         badge.gravity = Gravity.CENTER
-        val badgeOn = GradientDrawable()
-        badgeOn.shape = GradientDrawable.OVAL
-        badgeOn.setColor(cAccent)
-        val badgeOff = GradientDrawable()
-        badgeOff.shape = GradientDrawable.OVAL
-        badgeOff.setColor(Color.TRANSPARENT)
-        badgeOff.setStroke(maxOf(1, dp(1)), cHairStrong)
-        row.addView(badge, lp(dp(30), dp(30)))
+        badge.minWidth = dp(20)
+        badge.minHeight = dp(20)
+        badge.setPadding(dp(5), 0, dp(5), 0)
+        badge.background = shape(cAccent, 10)
+        val badgeParams = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.START)
+        badgeParams.setMargins(dp(4), dp(4), 0, 0)
+        tile.addView(badge, badgeParams)
 
+        row.addView(tile, lp(dp(56), dp(56)))
+
+        // Text column
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
 
-        val name = makeText("", 15f, cInk, sans)
+        val name = makeText("", 14.5f, cInk, sans)
         name.maxLines = 1
         name.ellipsize = TextUtils.TruncateAt.MIDDLE
         col.addView(name, lp(MATCH, WRAP))
 
-        val meta = makeText("", 12f, cMuted, sans)
-        meta.maxLines = 1
-        meta.ellipsize = TextUtils.TruncateAt.MIDDLE
-        col.addView(meta, lp(MATCH, WRAP, top = dp(4)))
+        val preview = makeText("", 12.5f, cAccent, sansMedium)
+        preview.maxLines = 1
+        preview.ellipsize = TextUtils.TruncateAt.MIDDLE
+        col.addView(preview, lp(MATCH, WRAP, top = dp(4)))
 
-        row.addView(col, lp(0, WRAP, 1f, left = dp(16)))
+        val info = makeText("", 11.5f, cFaint, sans)
+        info.maxLines = 1
+        info.ellipsize = TextUtils.TruncateAt.END
+        col.addView(info, lp(MATCH, WRAP, top = dp(3)))
+
+        row.addView(col, lp(0, WRAP, 1f, left = dp(14), right = dp(4)))
+
+        // Reorder and remove controls
+        val arrows = LinearLayout(this)
+        arrows.orientation = LinearLayout.VERTICAL
+        val up = control("↑")
+        val down = control("↓")
+        arrows.addView(up, lp(dp(36), dp(32)))
+        arrows.addView(down, lp(dp(36), dp(32)))
+        row.addView(arrows, lp(WRAP, WRAP))
+
+        val remove = control("×")
+        row.addView(remove, lp(dp(36), dp(40)))
+
         outer.addView(row, lp(MATCH, WRAP))
 
         val divider = View(this)
         divider.setBackgroundColor(cHair)
-        outer.addView(divider, lp(MATCH, hair(), left = dp(70), right = dp(24)))
+        outer.addView(divider, lp(MATCH, hair(), left = dp(94), right = dp(24)))
 
-        return RowHolder(outer, badge, name, meta, badgeOn, badgeOff)
+        return RowHolder(outer, img, extText, badge, name, preview, info, up, down, remove)
     }
 
-    private fun bindRow(h: RowHolder, entry: DocEntry) {
-        h.name.text = entry.name
-        val order = orderMap[entry.docId]
-        if (order != null) {
-            h.badge.text = (order + 1).toString()
-            h.badge.setTextColor(Color.WHITE)
-            h.badge.background = h.badgeOn
-            h.root.setBackgroundColor(cAccentRow)
-            h.meta.text = if (curBase.isEmpty()) {
-                "Add a base name to rename"
-            } else {
-                "→  " + targetNameFor(order, entry)
-            }
-            h.meta.setTextColor(cAccent)
+    private fun bindRow(h: RowHolder, item: Item, position: Int) {
+        h.badge.text = (position + 1).toString()
+        h.name.text = item.name
+
+        if (!item.renamable) {
+            h.preview.text = "Cannot be renamed from this source"
+            h.preview.setTextColor(cError)
+        } else if (curBase.isEmpty()) {
+            h.preview.text = "Add a base name to rename"
+            h.preview.setTextColor(cFaint)
         } else {
-            h.badge.text = ""
-            h.badge.background = h.badgeOff
-            h.root.setBackgroundColor(Color.TRANSPARENT)
-            val type = extensionOf(entry.name).removePrefix(".").uppercase(Locale.ROOT)
-            val size = formatSize(entry.size)
-            val typeLabel = if (type.isEmpty()) "FILE" else type
-            h.meta.text = if (size.isEmpty()) typeLabel else "$typeLabel   ·   $size"
-            h.meta.setTextColor(cMuted)
+            h.preview.text = "→  " + targetNameFor(position, item)
+            h.preview.setTextColor(cAccent)
         }
+
+        val type = extensionOf(item.name).removePrefix(".").uppercase(Locale.ROOT)
+        val typeLabel = if (type.isEmpty()) "FILE" else type
+        val size = formatSize(item.size)
+        h.info.text = if (size.isEmpty()) typeLabel else "$typeLabel   ·   $size"
+        h.ext.text = typeLabel.take(5)
+
+        val bmp = item.thumb
+        if (bmp != null) {
+            h.image.setImageBitmap(bmp)
+            h.image.visibility = View.VISIBLE
+            h.ext.visibility = View.GONE
+        } else {
+            h.image.setImageDrawable(null)
+            h.image.visibility = View.GONE
+            h.ext.visibility = View.VISIBLE
+            loadThumbnail(item)
+        }
+
+        h.up.alpha = if (position > 0) 1f else 0.25f
+        h.down.alpha = if (position < items.size - 1) 1f else 0.25f
+        h.up.setOnClickListener { moveItem(item, -1) }
+        h.down.setOnClickListener { moveItem(item, 1) }
+        h.remove.setOnClickListener { removeItem(item) }
     }
 
     // ---------------------------------------------------------------------------------------------
     // Models
     // ---------------------------------------------------------------------------------------------
 
-    private data class DocEntry(
-        val docId: String,
-        val uri: Uri,
-        val name: String,
+    private class Item(
+        var uri: Uri,
+        var name: String,
         val mime: String,
         val size: Long,
-        val flags: Int
-    )
+        val renamable: Boolean,
+        val supportsThumb: Boolean
+    ) {
+        var thumb: Bitmap? = null
+        var thumbRequested: Boolean = false
+    }
 
-    private class RenameJob(val entry: DocEntry, val targetName: String) {
-        var currentUri: Uri = entry.uri
-        var currentName: String = entry.name
+    private class RenameJob(val item: Item, val targetName: String) {
+        var currentUri: Uri = item.uri
+        var currentName: String = item.name
 
         /** 0 = original name, 1 = temporary name, 2 = final name. */
         var stage: Int = 0
@@ -1255,10 +1261,14 @@ class MainActivity : Activity() {
 
     private class RowHolder(
         val root: LinearLayout,
+        val image: ImageView,
+        val ext: TextView,
         val badge: TextView,
         val name: TextView,
-        val meta: TextView,
-        val badgeOn: GradientDrawable,
-        val badgeOff: GradientDrawable
+        val preview: TextView,
+        val info: TextView,
+        val up: TextView,
+        val down: TextView,
+        val remove: TextView
     )
 }
